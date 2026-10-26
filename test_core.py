@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 import wave
+from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -142,12 +143,14 @@ class CoreTests(unittest.TestCase):
         recorder = Recorder(self.store, item['id'])
         recorder.rate = 16000
         recorder.running = True
-        recorder.writer = threading.Thread(target=recorder._write)
-        recorder.writer.start()
-        # Constant non-silent synthetic input forces overlap after 25 seconds.
-        for _ in range(270):
-            recorder.frames.put(b'\xff\x0f' * 1600)
-        recorder.stop()
+        # Simulate continuous speech to exercise the maximum-duration fallback.
+        with patch('streaming_vad.StreamingVAD') as detector:
+            detector.return_value.feed.return_value = 0.0
+            recorder.writer = threading.Thread(target=recorder._write)
+            recorder.writer.start()
+            for _ in range(270):
+                recorder.frames.put(b'\xff\x0f' * 1600)
+            recorder.stop()
         rows = self.store.chunks(item['id'])
         self.assertEqual(len(rows), 2)
         self.assertAlmostEqual(rows[1]['overlap'], .8)

@@ -32,11 +32,17 @@ def connections():
 
 
 if __name__ == '__main__':
+    import argparse
+    from recognition_config import MODEL_IDS
+    parser = argparse.ArgumentParser(description='Download a local model without changing the active selection.')
+    parser.add_argument('--connections-only', action='store_true')
+    parser.add_argument('--model', choices=MODEL_IDS, default='small.en')
+    args = parser.parse_args()
     connections()
-    if '--connections-only' not in sys.argv:
+    if not args.connections_only:
         from faster_whisper.utils import download_model
-        target = ROOT / 'models' / 'small.en'
+        target = ROOT / 'models' / args.model
         target.mkdir(parents=True, exist_ok=True)
-        print('Downloading the English speech model once (roughly 500 MB).')
-        download_model('small.en', output_dir=str(target))
+        print(f'Downloading {args.model}. small.en is about 500 MB; Turbo is about 1.6 GB.')
+        download_model(MODEL_IDS[args.model], output_dir=str(target))
         print('Ready. Future transcription runs offline. Open Start Voice.cmd.')

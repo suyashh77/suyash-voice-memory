@@ -11,9 +11,8 @@ from array import array
 from pathlib import Path
 
 from memory_store import ROOT
-
-MODEL_ROOT = ROOT / 'models' / 'small.en'
-
+from adaptation import apply_rules
+from recognition_config import decoder_hints, load_config
 
 def import_segments(source, store, session):
     """Decode large imports incrementally; keep at most one short piece in memory."""
@@ -101,6 +100,12 @@ class Recorder:
         carry = b''
         overlap = 0.0
         try:
+            from streaming_vad import StreamingVAD
+            vad = StreamingVAD(self.rate)
+        except Exception as exc:
+            vad = None
+            self.notify('status', f'Neural pause detector unavailable ({exc}); saving fixed 25-second pieces.')
+        try:
             while True:
                 block = self.frames.get()
                 if block is None:
@@ -120,14 +125,20 @@ class Recorder:
                 samples = array('h', block)
                 rms = math.sqrt(sum(v*v for v in samples) / max(len(samples), 1)) / 32768
                 self.level = min(rms * 8, 1.0)
-                quiet = quiet + len(samples) / self.rate if rms < 0.008 else 0
                 # writeframes updates the WAV header so interrupted files remain recoverable.
                 audio.writeframes(block)
                 file.flush()
                 count += len(samples)
+                if vad is not None:
+                    try:
+                        quiet = vad.feed(block)
+                    except Exception as exc:
+                        vad = None
+                        quiet = 0
+                        self.notify('status', f'Pause detector failed ({exc}); using fixed pieces. Audio remains saved.')
                 tail = (tail + block)[-int(self.rate * .8) * 2:]
                 seconds = count / self.rate
-                if (seconds >= 10 and quiet >= .7) or seconds >= 25:
+                if (seconds >= 3 and quiet >= .7) or seconds >= 25:
                     audio.close()
                     file.close()
                     audio = file = None
@@ -181,6 +192,10 @@ class Transcriber:
         self.busy = False
         self.stopping = threading.Event()
         self.thread = None
+        self.config = load_config(store.root)
+        self.device = 'cpu'
+        self.model_path = ROOT / 'models' / self.config['model']
+        self.last_applied = []
 
     def start(self):
         self.thread = threading.Thread(target=self._run, daemon=True)
@@ -191,26 +206,73 @@ class Transcriber:
         os.environ['HF_HUB_OFFLINE'] = '1'
         os.environ['HF_HUB_DISABLE_TELEMETRY'] = '1'
         from faster_whisper import WhisperModel
-        if not (MODEL_ROOT / 'model.bin').exists():
+        if not (self.model_path / 'model.bin').exists():
             raise RuntimeError('Speech model missing. Run Setup Voice.cmd once while online.')
-        self.model = WhisperModel(str(MODEL_ROOT), device='cpu', compute_type='int8',
-                                 cpu_threads=min(8, max(2, (os.cpu_count() or 4) // 2)),
-                                 num_workers=1, local_files_only=True)
+        import ctranslate2
+        self.device = 'cpu'
+        if self.config['device'] in ('auto', 'cuda'):
+            try:
+                if ctranslate2.get_cuda_device_count() > 0:
+                    self.device = 'cuda'
+            except Exception as exc:
+                self.notify('status', f'GPU unavailable: {exc}. Using CPU.')
+        try:
+            self._load_device(self.device)
+        except Exception:
+            if self.device == 'cpu':
+                raise
+            self.notify('status', 'GPU could not load the model; using CPU.')
+            self._load_device('cpu')
         self.ready = True
 
-    def transcribe(self, path):
-        hints = ', '.join(self.store.vocabulary())[:1800]
-        segments, info = self.model.transcribe(str(path), language='en', beam_size=3,
+    def _load_device(self, device):
+        from faster_whisper import WhisperModel
+        self.model = WhisperModel(str(self.model_path), device=device,
+                                 compute_type='int8_float16' if device == 'cuda' else 'int8',
+                                 cpu_threads=min(8, max(2, (os.cpu_count() or 4) // 2)),
+                                 num_workers=1, local_files_only=True)
+        self.device = device
+
+    @property
+    def label(self):
+        return f'{self.config["model"]} / {self.device} / beam {self.config["beam_size"]}'
+
+    def transcribe(self, path, session=None, sequence=0, personalization=None):
+        enabled = self.config['personalization'] if personalization is None else personalization
+        context = self.store.recognition_context(session, sequence) if enabled else {'hints': [], 'previous': '', 'project': ''}
+        previous = context['previous'] if self.config['previous_context'] else ''
+        prompt, hints = decoder_hints(self.model.hf_tokenizer, context['hints'], previous)
+        segments, info = self.model.transcribe(str(path), language=self.config['language'], beam_size=self.config['beam_size'],
                     vad_filter=True, vad_parameters=dict(min_silence_duration_ms=500),
-                    initial_prompt=hints or None, hotwords=hints or None,
+                    initial_prompt=prompt if enabled else None, hotwords=hints if enabled else None,
                     condition_on_previous_text=False)
-        return ' '.join(segment.text.strip() for segment in segments).strip()
+        self.last_raw = ' '.join(segment.text.strip() for segment in segments).strip()
+        rules = self.store.adaptation_rules(context['project']) if enabled else []
+        adapted, self.last_applied = apply_rules(self.last_raw, rules)
+        return adapted
+
+    def process_chunk(self, chunk):
+        try:
+            text = self.transcribe(chunk['path'], chunk['session_id'], chunk['sequence'])
+        except Exception:
+            # CUDA can fail lazily while the transcription generator is consumed.
+            if self.device != 'cuda':
+                raise
+            self.model = None
+            import gc
+            gc.collect()
+            self._load_device('cpu')
+            self.notify('status', 'GPU transcription failed; retried on CPU.')
+            text = self.transcribe(chunk['path'], chunk['session_id'], chunk['sequence'])
+        self.store.finish_chunk(chunk['id'], self.last_raw, self.label,
+                                adapted=text, applied_rules=self.last_applied)
+        return text
 
     def _run(self):
         try:
             self.notify('status', 'Loading local speech model…')
             self.load()
-            self.notify('status', 'Ready · speech stays on this computer')
+            self.notify('status', f'Ready · {self.label} · speech stays on this computer')
         except Exception as exc:
             self.failure = str(exc)
             self.notify('error', self.failure)
@@ -226,11 +288,10 @@ class Transcriber:
                 if self.stopping.is_set():
                     break
                 try:
-                    text = self.transcribe(chunk['path'])
-                    self.store.finish_chunk(chunk['id'], text, 'small.en / CPU int8')
+                    self.process_chunk(chunk)
                     self.notify('transcribed', chunk['session_id'])
                 except Exception as exc:
-                    self.store.finish_chunk(chunk['id'], '', 'small.en / CPU int8', str(exc))
+                    self.store.finish_chunk(chunk['id'], '', self.label, str(exc))
                     self.notify('error', f'Audio saved, transcription failed: {exc}')
 
     def stop(self):

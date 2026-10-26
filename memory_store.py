@@ -67,6 +67,28 @@ class Store:
             columns = {r['name'] for r in c.execute('PRAGMA table_info(chunks)')}
             if 'overlap' not in columns:
                 c.execute('ALTER TABLE chunks ADD COLUMN overlap REAL NOT NULL DEFAULT 0')
+            for name, definition in {'adapted': 'TEXT', 'applied_rules': "TEXT NOT NULL DEFAULT '[]'",
+                                     'verified': 'INTEGER NOT NULL DEFAULT 0',
+                                     'dataset_split': "TEXT NOT NULL DEFAULT 'train'"}.items():
+                if name not in columns:
+                    c.execute(f'ALTER TABLE chunks ADD COLUMN {name} {definition}')
+            if 'verified' not in columns:
+                c.execute('UPDATE chunks SET verified=1 WHERE corrected IS NOT NULL')
+            c.executescript('''
+            CREATE TABLE IF NOT EXISTS correction_evidence (
+              chunk_id TEXT NOT NULL, project TEXT NOT NULL, source TEXT NOT NULL,
+              target TEXT NOT NULL, created TEXT NOT NULL,
+              PRIMARY KEY(chunk_id,source,target));
+            CREATE TABLE IF NOT EXISTS replacement_rules (
+              id INTEGER PRIMARY KEY, project TEXT NOT NULL, source TEXT NOT NULL,
+              target TEXT NOT NULL, enabled INTEGER NOT NULL DEFAULT 0,
+              updated TEXT NOT NULL, UNIQUE(project,source,target));
+            ''')
+            # Rebuild from latest labels, not every historical edit. Idempotent migration.
+            if not c.execute('SELECT 1 FROM correction_evidence LIMIT 1').fetchone():
+                rows = c.execute("SELECT c.*,m.project FROM chunks c JOIN memories m ON m.id=c.session_id WHERE c.corrected IS NOT NULL AND c.dataset_split='train'").fetchall()
+                for row in rows:
+                    self._learn(c, row, row['corrected'])
 
     @contextmanager
     def connect(self):
@@ -203,6 +225,9 @@ class Store:
         with self.connect() as c:
             c.execute('INSERT INTO chunks(id,session_id,sequence,path,duration,status,overlap) VALUES(?,?,?,?,?,?,?)',
                       (ident, session, sequence, str(path), duration, 'pending', overlap))
+            existing = c.execute('SELECT dataset_split FROM chunks WHERE session_id=? AND id!=? LIMIT 1', (session, ident)).fetchone()
+            if existing:
+                c.execute('UPDATE chunks SET dataset_split=? WHERE id=?', (existing[0], ident))
         return ident
 
     def chunks(self, session=None, pending=False):
@@ -217,10 +242,11 @@ class Store:
                     (' WHERE ' + ' AND '.join(where) if where else '') +
                     ' ORDER BY session_id,sequence', args)]
 
-    def finish_chunk(self, ident, text, model, error=''):
+    def finish_chunk(self, ident, text, model, error='', adapted=None, applied_rules=None):
         with self.connect() as c:
-            c.execute('UPDATE chunks SET original=?,model=?,status=?,error=? WHERE id=?',
-                      (text, model, 'failed' if error else 'done', error, ident))
+            c.execute('UPDATE chunks SET original=?,model=?,status=?,error=?,adapted=?,applied_rules=? WHERE id=?',
+                      (text, model, 'failed' if error else 'done', error, adapted,
+                       json.dumps(applied_rules or []), ident))
             session = c.execute('SELECT session_id FROM chunks WHERE id=?', (ident,)).fetchone()[0]
         self.refresh_transcript(session)
 
@@ -233,7 +259,8 @@ class Store:
             for r in chunks:
                 if r['status'] != 'done':
                     continue
-                part = r['corrected'] if r['corrected'] is not None else r['original']
+                part = (r['corrected'] if r['corrected'] is not None else
+                        r['adapted'] if r['adapted'] is not None else r['original'])
                 if r['overlap'] and paragraphs:
                     before, after = paragraphs[-1].split(), part.split()
                     normalize = lambda word: re.sub(r'[^\w]', '', word).casefold()
@@ -258,13 +285,97 @@ class Store:
     def correct(self, ident, text):
         with self.connect() as c:
             c.execute('BEGIN IMMEDIATE')
-            row = c.execute('SELECT * FROM chunks WHERE id=?', (ident,)).fetchone()
+            row = c.execute('SELECT c.*,m.project FROM chunks c JOIN memories m ON m.id=c.session_id WHERE c.id=?', (ident,)).fetchone()
             if not row or row['status'] != 'done':
                 raise ValueError('Choose a completed audio segment')
-            c.execute('UPDATE chunks SET corrected=? WHERE id=?', (text, ident))
+            c.execute('UPDATE chunks SET corrected=?,verified=1 WHERE id=?', (text, ident))
             c.execute('INSERT INTO corrections VALUES(?,?,?,?,?,?)',
                       (uuid.uuid4().hex, ident, row['original'], text, row['path'], now()))
+            self._learn(c, row, text)
         self.refresh_transcript(row['session_id'])
+
+    @staticmethod
+    def _learn(c, row, text):
+        from adaptation import replacements
+        c.execute('DELETE FROM correction_evidence WHERE chunk_id=?', (row['id'],))
+        if row['dataset_split'] != 'train':
+            return
+        for source, target in replacements(row['original'], text):
+            c.execute('INSERT OR REPLACE INTO correction_evidence VALUES(?,?,?,?,?)',
+                      (row['id'], row['project'], source.casefold(), target, now()))
+            c.execute('INSERT OR IGNORE INTO replacement_rules(project,source,target,updated) VALUES(?,?,?,?)',
+                      (row['project'], source.casefold(), target, now()))
+
+    def adaptation_rules(self, project):
+        with self.connect() as c:
+            rows = c.execute('''SELECT r.*,count(DISTINCT e.chunk_id) AS examples
+              FROM replacement_rules r LEFT JOIN correction_evidence e
+              ON e.project=r.project AND e.source=r.source AND e.target=r.target
+              WHERE r.project=? GROUP BY r.id ORDER BY examples DESC,r.updated DESC''', (project,)).fetchall()
+        result = [dict(r) for r in rows]
+        for item in result:
+            # No examples or conflicting current labels means no automatic rewriting.
+            targets = {r['target'].casefold() for r in result if r['source'] == item['source'] and r['examples']}
+            item['enabled'] = bool(item['enabled'] and item['examples'] and len(targets) == 1)
+        return result
+
+    def set_rule(self, ident, enabled):
+        with self.connect() as c:
+            row = c.execute('SELECT * FROM replacement_rules WHERE id=?', (ident,)).fetchone()
+            if not row:
+                raise ValueError('Unknown replacement')
+            if enabled:
+                c.execute('UPDATE replacement_rules SET enabled=0 WHERE project=? AND source=?',
+                          (row['project'], row['source']))
+            c.execute('UPDATE replacement_rules SET enabled=?,updated=? WHERE id=?', (int(enabled), now(), ident))
+
+    def recognition_context(self, session, sequence, exclude_sessions=()):
+        from adaptation import entity_like
+        project = self.get(session)['project'] if session else ''
+        candidates = []
+        with self.connect() as c:
+            # Manual terms are explicit. Learned terms are project-local and reversible.
+            candidates += [(1000, phrase) for phrase in self.vocabulary()]
+            rows = c.execute('''SELECT e.source,e.target,e.chunk_id,c.session_id,e.created
+              FROM correction_evidence e JOIN chunks c ON c.id=e.chunk_id
+              WHERE e.project=? AND c.dataset_split='train' ORDER BY e.created DESC''', (project,)).fetchall()
+            counts = {}
+            for row in rows:
+                if row['session_id'] in exclude_sessions:
+                    continue
+                target = row['target']
+                counts[target] = counts.get(target, 0) + 1
+            candidates += [(200 + min(n, 50), target) for target, n in counts.items()
+                           if entity_like(target) or n >= 2]
+            # Only confirmed memory titles supply nouns. Never inject arbitrary bodies/instructions.
+            for row in c.execute("SELECT title FROM memories WHERE project=? AND status='confirmed' AND kind!='transcript' ORDER BY updated DESC LIMIT 20", (project,)):
+                import adaptation
+                candidates += [(10, term) for term in adaptation.words(row['title']) if entity_like(term)]
+            previous = c.execute('''SELECT * FROM chunks WHERE session_id=? AND sequence<?
+                      AND status='done' ORDER BY sequence DESC LIMIT 2''', (session, sequence)).fetchall()
+        seen, hints = set(), []
+        for score, phrase in sorted(candidates, key=lambda p: -p[0]):
+            if phrase.casefold() not in seen:
+                hints.append(phrase)
+                seen.add(phrase.casefold())
+        text = ' '.join((r['corrected'] if r['corrected'] is not None else r['original'])
+                        for r in reversed(previous))[-1200:]
+        return {'project': project, 'hints': hints[:100], 'previous': text}
+
+    def verify_chunk(self, ident, split='train'):
+        if split not in ('train', 'validation', 'test'):
+            raise ValueError('Use train, validation or test')
+        with self.connect() as c:
+            row = c.execute('SELECT c.*,m.project FROM chunks c JOIN memories m ON m.id=c.session_id WHERE c.id=?', (ident,)).fetchone()
+            if not row or row['status'] != 'done':
+                raise ValueError('Choose completed audio')
+            # A split applies to the entire session: overlapping neighbors cannot leak.
+            c.execute('UPDATE chunks SET dataset_split=? WHERE session_id=?', (split, row['session_id']))
+            c.execute('DELETE FROM correction_evidence WHERE chunk_id IN (SELECT id FROM chunks WHERE session_id=?)', (row['session_id'],))
+            c.execute('UPDATE chunks SET verified=1,corrected=COALESCE(corrected,adapted,original) WHERE id=?', (ident,))
+            rows = c.execute('SELECT c.*,m.project FROM chunks c JOIN memories m ON m.id=c.session_id WHERE c.session_id=? AND c.corrected IS NOT NULL', (row['session_id'],)).fetchall()
+            for r in rows:
+                self._learn(c, r, r['corrected'])
 
     def vocabulary(self):
         with self.connect() as c:

@@ -6,17 +6,19 @@ from memory_store import Store
 from speech import Transcriber, import_segments
 
 
-def main(path):
+def main(path, model_dir=None):
     with tempfile.TemporaryDirectory() as temp:
         store = Store(temp)
         item = store.create('Validation', 'transcript', 'Synthetic sample')
         count = import_segments(path, store, item['id'])
         transcriber = Transcriber(store)
+        if model_dir:
+            from pathlib import Path
+            transcriber.model_path = Path(model_dir)
         transcriber.load()
         start = time.perf_counter()
         for chunk in store.chunks(pending=True):
-            text = transcriber.transcribe(chunk['path'])
-            store.finish_chunk(chunk['id'], text, 'small.en / CPU int8')
+            transcriber.process_chunk(chunk)
         text = store.get(item['id'])['body']
         assert 'local transcription test' in text.lower(), text
         assert 'share project notes' in text.lower(), text
@@ -27,4 +29,4 @@ def main(path):
 
 
 if __name__ == '__main__':
-    main(sys.argv[1])
+    main(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)

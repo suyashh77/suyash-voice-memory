@@ -127,6 +127,7 @@ class App:
         ttk.Button(actions, text='Share as a note', command=self.share_note).pack(side='left', padx=7)
         ttk.Button(actions, text='Import audio', command=self.import_audio).pack(side='left')
         ttk.Button(actions, text='My vocabulary', command=self.vocabulary).pack(side='right')
+        ttk.Button(actions, text='Recognition & learning', command=self.learning_settings).pack(side='right', padx=7)
         ttk.Label(self.talk, text='Improve a segment · listen, re-say, then confirm the correct words', style='Sub.TLabel').pack(anchor='w', pady=(2, 5))
         row = ttk.Frame(self.talk)
         row.pack(fill='x')
@@ -139,7 +140,7 @@ class App:
         ttk.Button(row, text='Save correction', command=self.save_correction).pack(side='right')
         self.correction = self._text(self.talk, height=2)
         self.correction.pack(fill='x', pady=(7, 0))
-        ttk.Label(self.talk, text='Feedback saves matched audio + corrected text. Vocabulary hints apply now; model retraining is a later step.', style='Sub.TLabel').pack(anchor='w', pady=(5, 0))
+        ttk.Label(self.talk, text='Corrections teach project vocabulary now. Review learned replacements in Recognition & learning.', style='Sub.TLabel').pack(anchor='w', pady=(5, 0))
 
     def _memory(self):
         bar = ttk.Frame(self.memory)
@@ -311,7 +312,10 @@ class App:
         row = self.chunk_rows[i]
         self.selected_chunk = row['id']
         self.correction.delete('1.0', 'end')
-        self.correction.insert('1.0', row['corrected'] if row['corrected'] is not None else row['original'])
+        self.correction.insert('1.0', row['corrected'] if row['corrected'] is not None else
+                               row['adapted'] if row.get('adapted') is not None else row['original'])
+        if row.get('applied_rules') and row['applied_rules'] != '[]':
+            self.status.set('Learned replacements applied. Original recognition: ' + row['original'][:180])
 
     def listen(self):
         i = self.segment.current()
@@ -343,7 +347,7 @@ class App:
             self.store.correct(self.selected_chunk, self.correction.get('1.0', 'end-1c').strip())
             self.render_transcript()
             self.refresh_memory()
-            self.status.set('Correction saved with the original audio. Add difficult names in My vocabulary to help future recognition.')
+            self.status.set('Correction saved. Project vocabulary updated; review learned replacements in Recognition & learning.')
         except Exception as exc:
             self.alert(str(exc))
 
@@ -410,6 +414,95 @@ class App:
             except Exception as exc:
                 self.alert(str(exc))
         ttk.Button(f, text='Add these hints', command=save, style='Accent.TButton').pack(anchor='e', pady=(10, 0))
+
+    def learning_settings(self):
+        from recognition_config import installed_models, load_config, save_config
+        config = load_config(self.store.root)
+        window = tk.Toplevel(self.root)
+        window.title('Recognition & learning')
+        window.geometry('820x650')
+        f = ttk.Frame(window, padding=20)
+        f.pack(fill='both', expand=True)
+        ttk.Label(f, text='Choose the model; keep its raw output', style='Title.TLabel').pack(anchor='w')
+        ttk.Label(f, text='Settings apply after restart. Use Install Turbo.cmd for the larger model. CPU works without CUDA.', wraplength=760).pack(anchor='w', pady=8)
+        row = ttk.Frame(f)
+        row.pack(fill='x')
+        model = tk.StringVar(value=config['model'])
+        device = tk.StringVar(value=config['device'])
+        ttk.Combobox(row, textvariable=model, values=installed_models(), state='readonly', width=26).pack(side='left')
+        ttk.Combobox(row, textvariable=device, values=['cpu','auto','cuda'], state='readonly', width=10).pack(side='left', padx=8)
+        enabled = tk.BooleanVar(value=config['personalization'])
+        ttk.Checkbutton(row, text='Use personal hints and approved replacements', variable=enabled).pack(side='left')
+        def save():
+            config.update(model=model.get(), device=device.get(), personalization=enabled.get())
+            save_config(config, self.store.root)
+            self.status.set('Recognition settings saved. Restart the app to apply them.')
+        ttk.Button(f, text='Save settings for next launch', command=save).pack(anchor='w', pady=10)
+        project = self.store.get(self.session)['project'] if self.session else self.project.get()
+        ttk.Label(f, text=f'Learned replacements · {project}', style='Title.TLabel').pack(anchor='w', pady=(10, 5))
+        ttk.Label(f, text='Corrections add hints automatically. Whole-word rewriting requires your approval and can be disabled.', wraplength=760).pack(anchor='w')
+        tree = ttk.Treeview(f, columns=('target','examples','enabled'), height=7)
+        tree.heading('#0', text='Heard as')
+        tree.column('#0', width=230)
+        for key in ('target', 'examples', 'enabled'):
+            tree.heading(key, text={'target':'Replace with', 'examples':'Audio examples', 'enabled':'Enabled'}[key])
+            tree.column(key, width=220 if key == 'target' else 100)
+        tree.pack(fill='both', expand=True, pady=8)
+        def refresh():
+            tree.delete(*tree.get_children())
+            for r in self.store.adaptation_rules(project):
+                tree.insert('', 'end', iid=str(r['id']), text=r['source'], values=(r['target'],r['examples'],'Yes' if r['enabled'] else 'No'))
+        def rule(enabled):
+            if tree.selection():
+                self.store.set_rule(int(tree.selection()[0]), enabled)
+                refresh()
+        buttons = ttk.Frame(f)
+        buttons.pack(fill='x')
+        ttk.Button(buttons, text='Enable selected', command=lambda: rule(True)).pack(side='left')
+        ttk.Button(buttons, text='Disable selected', command=lambda: rule(False)).pack(side='left', padx=8)
+        def raw():
+            row = next((r for r in self.store.chunks(self.session) if r['id'] == self.selected_chunk), None)
+            if not row:
+                self.alert('Choose an audio segment in Talk first.')
+                return
+            details = tk.Toplevel(window)
+            details.title('Original and adjusted recognition')
+            details.geometry('760x480')
+            text = self._text(details, height=15)
+            text.pack(fill='both', expand=True, padx=15, pady=15)
+            text.insert('1.0', 'ORIGINAL RECOGNITION\n' + row['original'] + '\n\nADJUSTED OUTPUT\n' +
+                        (row['adapted'] or row['original']) + '\n\nUSER LABEL\n' +
+                        (row['corrected'] if row['corrected'] is not None else '(not verified)') +
+                        '\n\nAPPLIED REPLACEMENTS\n' + row['applied_rules'])
+            text.configure(state='disabled')
+        ttk.Button(buttons, text='Inspect original recognition', command=raw).pack(side='right')
+        ttk.Label(f, text='Keep a separate test session before comparing models', style='Title.TLabel').pack(anchor='w', pady=(16, 6))
+        role = tk.StringVar(value='train')
+        footer = ttk.Frame(f)
+        footer.pack(fill='x')
+        ttk.Combobox(footer, textvariable=role, state='readonly', values=['train','validation','test'], width=15).pack(side='left')
+        def verify():
+            try:
+                self.store.verify_chunk(self.selected_chunk, role.get())
+                refresh()
+                self.status.set('Selected segment verified. Its whole session is assigned to ' + role.get() + '. Test/validation labels do not teach vocabulary.')
+            except Exception as exc:
+                self.alert(str(exc))
+        ttk.Button(footer, text='Verify selected audio segment', command=verify).pack(side='left', padx=8)
+        def export():
+            destination = filedialog.askdirectory(title='Choose the parent folder for a private verified dataset')
+            if not destination:
+                return
+            try:
+                from personal_dataset import export_dataset
+                out = Path(destination) / ('voice-dataset-' + datetime.now().strftime('%Y%m%d-%H%M%S'))
+                summary = export_dataset(self.store, out)
+                self.status.set(f'Private dataset exported to {out}. Split summary: {summary}')
+            except Exception as exc:
+                self.alert(str(exc))
+        ttk.Button(footer, text='Export verified dataset', command=export).pack(side='right')
+        ttk.Label(f, text='Listen and check the words first. Shared notes do not count as verified audio. Dataset tools export only verified segments.', wraplength=760, style='Sub.TLabel').pack(anchor='w', pady=8)
+        refresh()
 
     def refresh_memory(self):
         selected = self.tree.selection()
