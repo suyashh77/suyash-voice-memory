@@ -18,7 +18,45 @@ The runtime loads the downloaded model locally and does not send recordings to a
 
 Add names and short phrases in **My vocabulary** to guide future recognition. For feedback, select a segment, listen to it, then edit the text or use **Re-say correction**. Stop the correction recording, review its words, and choose **Save correction**.
 
-The app preserves original audio, original text, and corrected text. These pairs could support future model adaptation, but this version does not retrain itself. Re-speaking uses the same recognizer, so its proposed correction can also be wrong.
+The app preserves original audio, original recognition, adjusted text, approved replacements, and corrected text. Saving a correction now mines short phrase substitutions and adds likely names or recurring terms to project-specific decoder hints. Re-speaking uses the same recognizer, so its proposed correction can also be wrong.
+
+Open **Recognition & learning** to review learned replacements. Explicit approval enables whole-word substitutions for that project. Conflicting examples disable a rule, and saving the same segment repeatedly counts as one example. Reverting a label removes its learned evidence. Wholesale rewrites do not create phrase rules.
+
+Prompt context and hotwords have separate budgets measured with the active model's tokenizer. Only the current session's preceding segments supply speech context. Confirmed memory titles can supply names, while memory bodies stay out of the decoder prompt. This limits prompt pollution and avoids turning long notes into invented speech.
+
+Live capture uses stateful Silero neural VAD on the writer thread. Audio is saved before pause detection. Natural pauses split segments after at least three seconds. Continuous speech still needs a maximum-duration boundary, so the 25-second fallback retains a short overlap. If VAD fails, fixed-duration recording continues with a visible status message. Saved microphone WAVs retain the microphone's native rate. Dataset exports resample to mono 16 kHz.
+
+## Model selection and evaluation
+
+**Install Turbo.cmd** downloads `large-v3-turbo` using the model mapping supported by faster-whisper. Choose an installed model in **Recognition & learning**, then restart. `small.en` remains the default until you choose otherwise. CPU uses int8 and CUDA uses int8_float16, with CPU retry if model loading or actual GPU decoding fails. CUDA libraries and a healthy driver are still required for GPU operation. Both CPU models use beam size 5 by default.
+
+Turbo is a candidate for better recognition, not a guaranteed winner for every speaker. Its original model card describes a quality/speed tradeoff relative to large-v3. Compare accuracy and processing time on your actual recordings before choosing a default.
+
+To measure improvement, reserve separate recording sessions as **validation** or **test** in Recognition & learning, then listen and verify their words. The split applies to the whole session, including overlapping neighbors and later segments. These labels do not teach hints or replacements. Freeze manually added vocabulary and shared title hints before recording test sessions too.
+
+```powershell
+python benchmark_voice.py --data data --model small.en --output benchmarks/small.json
+python benchmark_voice.py --data data --model large-v3-turbo --output benchmarks/turbo.json
+```
+
+Each report compares plain and personalized decoding on the same verified test segments and reports word error rate and processing time. It excludes previous reference transcripts from decoder context and contains aggregate scores only. Warm-up, sample size, microphone conditions, and overlap affect interpretation. A lower score on a few recordings cannot establish superiority to every commercial or open model.
+
+## Optional offline weight adaptation
+
+The recording app never runs backpropagation. Its CTranslate2 backend performs inference. An optional research path exports verified labels, trains LoRA adapters with PyTorch, and converts a merged candidate back to CTranslate2:
+
+```powershell
+python personal_dataset.py datasets/experiment-001 --data data
+python train_personal_voice.py datasets/experiment-001/manifest.jsonl --base-model LOCAL_HF_WHISPER_FOLDER --output experiments/run-001 --check-only
+```
+
+The exporter requires a fresh destination and exports only user-verified chunks. It retains source IDs, groups by session, detects exact duplicate audio across splits, and creates mono 16 kHz WAV files. For training, use a separate environment with `requirements-training.txt` and a locally downloaded Hugging Face Whisper checkpoint matching the intended base model. CTranslate2 inference weights cannot be used as trainable PyTorch weights.
+
+Remove `--check-only` to train, and add `--convert` to create `experiments/run-001/ct2`. The optional trainer applies rank-16 LoRA to query/value attention projections, uses separate validation sessions to select an adapter by validation loss, and leaves test sessions untouched. Before activation, compare candidate WER and latency against the base model on held-out audio. Candidate conversion and activation are separate steps. Copy an accepted CT2 candidate into a new `models/` subfolder and select it explicitly.
+
+This training path passed a tiny random-model smoke test through LoRA updates, adapter selection, merging, CTranslate2 conversion and local decoding. That validates the pipeline only. No personal acoustic model has been trained or demonstrated an accuracy gain. In the optional training environment, `python verify_training.py` repeats a small pipeline check using artificial tones and labels, not voice data. It requires the installed small.en tokenizer file.
+
+Training time and memory depend on model and hardware. No fixed amount of corrected speech or rehearsal percentage guarantees improvement. Include verified unchanged examples and varied recording conditions, keep a general-speech regression set, and increase training only when measured results support it. No automatic training schedule or cloud upload is configured.
 
 ## Shared memory
 
@@ -34,7 +72,7 @@ Recordings create private transcripts. **Share as a note** creates a shared snap
 
 The MCP server exposes five tools: `memory_map`, `search_memories`, `read_memory`, `project_context`, and `propose_memory`. Retrieval includes source information and revisions. AI proposals stay out of retrieval until the user confirms them in the app. Revision checks prevent stale edits from silently replacing newer records.
 
-Search uses SQLite full-text keyword matching. Semantic embeddings, a knowledge graph, automatic chat-history import, acoustic fine-tuning, voice cloning, and video generation are outside this version.
+Memory search uses SQLite full-text keyword matching. Semantic memory embeddings, a knowledge graph, automatic chat-history import, voice cloning, and video generation remain outside this version. The optional ASR adaptation tools operate locally and do not change memory sharing states.
 
 ## Connect AI clients
 
@@ -70,7 +108,7 @@ The application uses Python, Tkinter, sounddevice, faster-whisper, and the offic
 After installing dependencies, run:
 
 ```powershell
-python -m unittest test_core -v
+python -m unittest test_core test_adaptation -v
 python verify_mcp.py
 python verify_offline.py path/to/synthetic-test.wav
 ```

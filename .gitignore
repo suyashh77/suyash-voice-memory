@@ -21,3 +21,9 @@ __pycache__/
 
 # Personal seed script from the original local installation
 initialize_memory.py
+datasets/
+experiments/
+benchmarks/
+*.safetensors
+*.pt
+*.pth
