@@ -1,0 +1,23 @@
+# Local runtime, speech models, and personal data
+.venv/
+.cache/
+models/
+data/
+temp/
+connections/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.log
+*.sqlite*
+*.db
+*.wav
+*.mp3
+*.m4a
+*.webm
+.env
+.env.*
+!.env.example
+
+# Personal seed script from the original local installation
+initialize_memory.py

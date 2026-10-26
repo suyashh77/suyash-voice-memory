@@ -1,0 +1,4 @@
+faster-whisper==1.2.1
+sounddevice==0.5.6
+mcp==1.30.0
+av==16.0.1
